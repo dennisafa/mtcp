@@ -42,6 +42,8 @@
 #define NAME_LIMIT 256
 #define FULLNAME_LIMIT 512
 
+#define DEBUG 0
+
 #ifndef TRUE
 #define TRUE (1)
 #endif
@@ -59,6 +61,11 @@
 #ifndef MAX_CPUS
 #define MAX_CPUS        16
 #endif
+
+#define _NF_MSG_POOL_NAME "NF_MSG_MEMPOOL"
+static struct rte_mempool *nf_msg_pool;
+
+static int msg_core;
 
 /*----------------------------------------------------------------------------*/
 struct file_cache {
@@ -88,12 +95,21 @@ struct thread_context {
         struct server_vars *svars;
 };
 
-struct nf_files {
-        struct server_vars *sv;
-        struct mtcp_epoll_event *ev;
-        int file_sent;
+struct onvm_send_mtcp_epoll_event {
+        struct mtcp_epoll_event *epoll_event;
         char *file_buffer;
-        char *response;
+        int req_len;
+};
+
+struct onvm_send_mtcp_response_data {
+        char *response_buf;
+        int set_sockid;
+        rte_atomic16_t done;
+        long int bufsize;
+        long int total_sent;
+        uint32_t epoll_type;
+        uint8_t keep_alive;
+        int epoll_mod;
 };
 
 int keep_running_msg = 1;
@@ -109,8 +125,9 @@ static int finished;
 
 
 const char *www_main;
-static struct file_cache fcache[MAX_FILES];
 static int nfiles;
+
+char *GetFileName(int rd, struct server_vars *server_data);
 
 /*----------------------------------------------------------------------------*/
 static char *
@@ -128,7 +145,6 @@ StatusCodeToString(int scode) {
         return NULL;
 }
 
-/*----------------------------------------------------------------------------*/
 void
 CleanServerVariable(struct server_vars *sv) {
         sv->recv_len = 0;
@@ -140,16 +156,12 @@ CleanServerVariable(struct server_vars *sv) {
         sv->keep_alive = 0;
 }
 
-/*----------------------------------------------------------------------------*/
 void
-CloseConnection(struct thread_context *ctx, int sockid, struct server_vars *sv) {
+CloseConnection(struct thread_context *ctx, int sockid) {
         mtcp_epoll_ctl(ctx->mctx, ctx->ep, MTCP_EPOLL_CTL_DEL, sockid, NULL);
         mtcp_close(ctx->mctx, sockid);
 }
-/*----------------------------------------------------------------------------*/
 
-/*----------------------------------------------------------------------------*/
-/*----------------------------------------------------------------------------*/
 int
 AcceptConnection(struct thread_context *ctx, int listener) {
         mctx_t mctx = ctx->mctx;
@@ -280,149 +292,17 @@ CreateListeningSocket(struct thread_context *ctx) {
 
 /*----------------------------------------------------------------------------*/
 
-static int
-SendUntilAvailable(struct thread_context *ctx, int sockid, struct nf_files *nf_files) {
-        int ret;
-        int sent;
-        int len;
-        struct server_vars *sv;
-        sv = nf_files->sv;
 
-        if (sv->done || !sv->rspheader_sent) {
-                return 0;
-        }
-        //printf("File size: %d Buffer size: %d", sv->fsize, sizeof(nf_files->file_buffer));
 
-        sent = 0;
-        ret = 1;
-        while (ret > 0) {
-                len = MIN(SNDBUF_SIZE, sv->fsize - sv->total_sent);
-                if (len <= 0) {
-                        break;
-                }
-                ret = mtcp_write(ctx->mctx, sockid, nf_files->file_buffer + sv->total_sent, len);
-                //printf("Ret = %d\n\n", ret);
-                if (ret < 0) {
-                        TRACE_APP("Connection closed with client.\n");
-                        break;
-                }
-                TRACE_APP("Socket %d: mtcp_write try: %d, ret: %d\n", sockid, len, ret);
-                sent += ret;
-                sv->total_sent += ret;
-        }
+void printOnvmData(struct onvm_send_mtcp_response_data *data) {
 
-        if (sv->total_sent >= sv->fsize) {
-                struct mtcp_epoll_event ev;
-                sv->done = 1;
-                finished++;
+        //printf("File buffer: %s\n", data->response_buf);
+        printf("Socket ID %d\n", data->set_sockid);
+        printf("Buf size %lu\n", data->bufsize);
+        printf("Total sent %lu\n", data->total_sent);
+        printf("Epoll type: %d", data->epoll_type);
+        printf("Epoll mod: %d", data->epoll_mod);
 
-                if (sv->keep_alive) {
-                        /* if keep-alive connection, wait for the incoming request */
-                        ev.events = MTCP_EPOLLIN;
-                        ev.data.sockid = sockid;
-                        mtcp_epoll_ctl(ctx->mctx, ctx->ep, MTCP_EPOLL_CTL_MOD, sockid, &ev);
-
-                        CleanServerVariable(sv);
-                } else {
-                        /* else, close connection */
-                        CloseConnection(ctx, sockid, sv);
-                }
-        }
-
-        return sent;
-}
-
-static int
-HandleReadEvent(struct thread_context *ctx, int sockid, struct server_vars *sv) {
-        struct mtcp_epoll_event ev;
-        char buf[HTTP_HEADER_LEN];
-        char url[URL_LEN];
-        char response[HTTP_HEADER_LEN];
-        int scode;                        // status code
-        time_t t_now;
-        char t_str[128];
-        char keepalive_str[128];
-        int rd;
-        int i;
-        int len;
-        int sent;
-
-/* HTTP request handling */
-        rd = mtcp_read(ctx->mctx, sockid, buf, HTTP_HEADER_LEN);
-        if (rd <= 0) {
-                return rd;
-        }
-        memcpy(sv->request + sv->recv_len, (char *) buf, MIN(rd, HTTP_HEADER_LEN - sv->recv_len));
-        sv->recv_len += rd;
-//sv->request[rd] = '\0';
-//fprintf(stderr, "HTTP Request: \n%s", request);
-        sv->request_len = find_http_header(sv->request, sv->recv_len);
-        if (sv->request_len <= 0) {
-                TRACE_ERROR("Socket %d: Failed to parse HTTP request header.\n"
-                            "read bytes: %d, recv_len: %d, "
-                            "request_len: %d, strlen: %ld, request: \n%s\n",
-                            sockid, rd, sv->recv_len,
-                            sv->request_len, strlen(sv->request), sv->request);
-                return rd;
-        }
-
-        http_get_url(sv->request, sv->request_len, url, URL_LEN);
-        TRACE_APP("Socket %d URL: %s\n", sockid, url);
-        sprintf(sv->fname, "%s%s", www_main, url);
-        TRACE_APP("Socket %d File name: %s\n", sockid, sv->fname);
-
-        sv->keep_alive = FALSE;
-        if (http_header_str_val(sv->request, "Connection: ",
-                                strlen("Connection: "), keepalive_str, 128)) {
-                if (strstr(keepalive_str, "Keep-Alive")) {
-                        sv->keep_alive = TRUE;
-                } else if (strstr(keepalive_str, "Close")) {
-                        sv->keep_alive = FALSE;
-                }
-        }
-
-/* Find file in cache */
-        scode = 404;
-        for (i = 0; i < nfiles; i++) {
-                if (strcmp(sv->fname, fcache[i].fullname) == 0) {
-                        sv->fsize = fcache[i].size;
-                        sv->fidx = i; // File index from fcache
-                        scode = 200;
-                        break;
-                }
-        }
-        TRACE_APP("Socket %d File size: %ld (%ldMB)\n",
-                  sockid, sv->fsize, sv->fsize / 1024 / 1024);
-
-/* Response header handling */
-        time(&t_now);
-        strftime(t_str, 128, "%a, %d %b %Y %X GMT", gmtime(&t_now));
-        if (sv->keep_alive)
-                sprintf(keepalive_str, "Keep-Alive");
-        else
-                sprintf(keepalive_str, "Close");
-
-        sprintf(response, "HTTP/1.1 %d %s\r\n"
-                          "Date: %s\r\n"
-                          "Server: Webserver on Middlebox TCP (Ubuntu)\r\n"
-                          "Content-Length: %ld\r\n"
-                          "Connection: %s\r\n\r\n",
-                scode, StatusCodeToString(scode), t_str, sv->fsize, keepalive_str);
-        len = strlen(response);
-        TRACE_APP("Socket %d HTTP Response: \n%s", sockid, response);
-        sent = mtcp_write(ctx->mctx, sockid, response, len);
-        TRACE_APP("Socket %d Sent response header: try: %d, sent: %d\n",
-                  sockid, len, sent);
-        assert(sent == len);
-        sv->rspheader_sent = TRUE;
-
-        ev.events = MTCP_EPOLLIN | MTCP_EPOLLOUT;
-        ev.data.sockid = sockid;
-        mtcp_epoll_ctl(ctx->mctx, ctx->ep, MTCP_EPOLL_CTL_MOD, sockid, &ev);
-
-        //SendUntilAvailable(ctx, sockid, sv);
-
-        return rd;
 }
 
 
@@ -431,40 +311,69 @@ WriteMessages(void *ctx) {
 
         struct onvm_nf_msg *msg;
         struct mtcp_epoll_event ev;
-        struct nf_files *nf_files;
+        struct onvm_send_mtcp_response_data *onvm_data;
         struct rte_ring *msg_q;
         struct onvm_nf *nf;
-        struct server_vars *sv;
-        int sockid, sent, len;
+        int sockid, sent;
         struct thread_context *mtcp_ctx;
         mtcp_ctx = (struct thread_context *) ctx;
 
+        long int total_sent = 0;
+        long int len;
+
+        mtcp_core_affinitize(msg_core);
+
         nf = &nfs[1];
         msg_q = nf->msg_q;
+        nf_msg_pool = rte_mempool_lookup(_NF_MSG_POOL_NAME);
+
+        if (nf_msg_pool == NULL || msg_q == NULL) {
+                printf("Message pool not found\n");
+                exit(EXIT_FAILURE);
+        }
 
         // Check and see if this NF has any messages from the manager
         while (keep_running_msg) {
                 if (rte_ring_count(msg_q) > 0) {
                         msg = NULL;
                         rte_ring_dequeue(msg_q, (void **) (&msg));
-                        nf_files = (struct nf_files *) msg->msg_data;
-                        sockid = nf_files->ev->data.sockid;
-                        sv = nf_files->sv;
-                        len = strlen(nf_files->response);
+                        onvm_data = (struct onvm_send_mtcp_response_data *) msg->msg_data;
+                        sockid = onvm_data->set_sockid;
 
-                        sent = mtcp_write(mtcp_ctx->mctx, sockid, nf_files->response, len);
-                        assert(sent == len);
-                        sv->rspheader_sent = 1;
+                        sent = 1;
+                        while (sent > 0) {
+                                len = MIN(SNDBUF_SIZE, onvm_data->bufsize - onvm_data->total_sent);
+                                sent = mtcp_write(mtcp_ctx->mctx, sockid, onvm_data->response_buf + onvm_data->total_sent, len);
 
-                        ev.events = MTCP_EPOLLOUT;
-                        ev.data.sockid = sockid;
-                        mtcp_epoll_ctl(mtcp_ctx->mctx, mtcp_ctx->ep, MTCP_EPOLL_CTL_MOD, sockid, &ev);
+                                if (sent < 0) {
+                                        break;
+                                }
+                                onvm_data->total_sent += sent;
+                                total_sent += sent;
+                        }
 
-                        SendUntilAvailable(mtcp_ctx, sockid, nf_files);
+                        if (onvm_data->epoll_mod > 0) {
+                                ev.events = onvm_data->epoll_type;
+                                ev.data.sockid = onvm_data->set_sockid;
+                                mtcp_epoll_ctl(mtcp_ctx->mctx, mtcp_ctx->ep, MTCP_EPOLL_CTL_MOD, sockid, &ev);
+                        }
+
+                        if (DEBUG) printf("Wrote back %d total\n", onvm_data->total_sent);
+
+                        if (onvm_data->total_sent >= onvm_data->bufsize && onvm_data->epoll_type == -1) {
+                                if (onvm_data->keep_alive) {
+                                        ev.events = MTCP_EPOLLIN;
+                                        ev.data.sockid = onvm_data->set_sockid;
+                                        mtcp_epoll_ctl(mtcp_ctx->mctx, mtcp_ctx->ep, MTCP_EPOLL_CTL_MOD, sockid, &ev);
+                                } else {
+                                        CloseConnection(ctx, onvm_data->set_sockid);
+                                }
+                        }
+
+                        rte_mempool_put(nf_msg_pool, (void *) msg);
+                        rte_atomic16_set(&onvm_data->done, 1);
                 }
         }
-
-
 }
 
 
@@ -503,14 +412,14 @@ RunServerThread(void *arg) {
                 exit(-1);
         }
 
-        if ((thr = pthread_create(&msg_thread, NULL, WriteMessages, (void*) ctx) < 0)) {
+        if ((thr = pthread_create(&msg_thread, NULL, WriteMessages, (void *) ctx) < 0)) {
                 printf("Failed to spawn main loop thread, error %d", thr);
         }
-        www_main = "www";
 
-
-        struct nf_files *to_nf = (struct nf_files *) rte_zmalloc("nf_files", sizeof(struct nf_files), 0);
-        struct server_vars *sv;
+        struct onvm_send_mtcp_epoll_event *mtcp_data = (struct onvm_send_mtcp_epoll_event *) rte_zmalloc(
+                "onvm_send_mtcp_epoll_event", sizeof(struct onvm_send_mtcp_epoll_event), 0);
+        struct server_vars *server_data;
+        char *file_name;
         char buf[HTTP_HEADER_LEN];
         char url[URL_LEN];
         int rd, sockid;
@@ -525,47 +434,33 @@ RunServerThread(void *arg) {
 
                 do_accept = FALSE;
                 for (i = 0; i < nevents; i++) {
-                        printf("Number of events = %d", nevents);
+                        if (DEBUG) printf("Number of events = %d", nevents);
                         if (events[i].data.sockid == listener) {
                                 /* if the event is for the listener, accept connection */
                                 do_accept = TRUE;
+                                if (DEBUG) printf("Accepting event\n");
 
-                        }
-                        else if (events[i].events & MTCP_EPOLLIN) {
-                                printf("Reading event %d\n", i);
-                                to_nf->sv = &ctx->svars[events[i].data.sockid];
-                                to_nf->ev = &events[i];
-                                sv = to_nf->sv;
-                                //CleanServerVariable(sv);
+                        } else if (events[i].events & MTCP_EPOLLIN) {
+
+                                if (DEBUG) printf("Reading EPOLLIN event\n");
                                 sockid = events[i].data.sockid;
-
                                 rd = mtcp_read(ctx->mctx, sockid, buf, HTTP_HEADER_LEN);
                                 if (rd <= 0) {
                                         printf("Could not read from socket\n");
                                         break;
                                 }
-                                memcpy(sv->request + sv->recv_len, (char *) buf,
-                                       MIN(rd, HTTP_HEADER_LEN - sv->recv_len));
-                                sv->recv_len += rd;
+                                server_data = &ctx->svars[events[i].data.sockid];
+                                mtcp_data->epoll_event = &events[i];
+                                mtcp_data->file_buffer = (char *) rte_zmalloc("HTTP buffer", HTTP_HEADER_LEN, 0);
+                                memcpy(mtcp_data->file_buffer, (char *) buf,
+                                       HTTP_HEADER_LEN);
 
-                                sv->request_len = find_http_header(sv->request, sv->recv_len);
-                                if (sv->request_len <= 0) {
-                                        TRACE_ERROR("Socket %d: Failed to parse HTTP request header.\n"
-                                                    "read bytes: %d, recv_len: %d, "
-                                                    "request_len: %d, strlen: %ld, request: \n%s\n",
-                                                    sockid, rd, sv->recv_len,
-                                                    sv->request_len, strlen(sv->request), sv->request);
-                                        break;
-                                }
-
-                                http_get_url(sv->request, sv->request_len, url, URL_LEN);
-                                TRACE_APP("Socket %d URL: %s\n", sockid, url);
-                                sprintf(sv->fname, "%s%s", www_main, url);
-                                TRACE_APP("Socket %d File name: %s\n", sockid, sv->fname);
-                                onvm_nflib_send_msg_to_nf(2, (void *) to_nf);
-                        }
-                        else {
-                                SendUntilAvailable(ctx, sockid, to_nf);
+                                if (DEBUG) printf("Sending to worker NF 2\n");
+                                onvm_nflib_send_msg_to_nf(2, (void *) mtcp_data);
+                        } else {
+                                if (DEBUG) printf("Sending epoll out event to worker\n");
+                                mtcp_data->epoll_event = &events[i];
+                                onvm_nflib_send_msg_to_nf(2, (void *) mtcp_data);
                         }
 
                 }
@@ -616,8 +511,9 @@ main(int argc, char **argv) {
         num_cores = GetNumCPUs();
         core_limit = num_cores;
         process_cpu = -1;
+        msg_core = -1;
 
-        while (-1 != (o = getopt(argc, argv, "N:f:c:b"))) {
+        while (-1 != (o = getopt(argc, argv, "N:f:c:b:m:p:"))) {
                 switch (o) {
                         case 'N':
                                 core_limit = mystrtol(optarg, 10);
@@ -648,6 +544,15 @@ main(int argc, char **argv) {
                         case 'b':
                                 backlog = mystrtol(optarg, 10);
                                 break;
+
+                        case 'm':
+                                msg_core = mystrtol(optarg, 10);
+                                break;
+
+                        case 'p':
+                                /* open the directory to serve */
+                                www_main = optarg;
+                                break;
                 }
         }
 
@@ -667,6 +572,11 @@ main(int argc, char **argv) {
         if (backlog > mcfg.max_concurrency) {
                 TRACE_CONFIG("backlog can not be set larger than CONFIG.max_concurrency\n");
                 return FALSE;
+        }
+
+        if (msg_core < 0) {
+                TRACE_CONFIG("Invalid core selection\n");
+                exit(EXIT_FAILURE);
         }
 
 /* if backlog is not specified, set it to 4K */
